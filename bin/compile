@@ -30,9 +30,6 @@ curl_retry_on_18() {
   return $ec
 }
 
-echo "-----> Root directory sizes:"
-echo "Root folder contents (depth 0):" | indent
-du -sh /* 2>/dev/null | indent || echo "Cannot access root" | indent
 
 # Install Git
 echo '-----> Installing Git'
@@ -57,27 +54,7 @@ fi
 # Use cached version if available
 if [ -d "$CACHE_DIR/git" ]; then
   echo "Using cached Git installation" | indent
-  cp -a --preserve=links "$CACHE_DIR/git"/* "$INSTALL_DIR"
-  
-  echo "Git install directory contents:" | indent
-  find "$INSTALL_DIR" \( -type f -o -type l \) -exec sh -c '
-    file="$1"
-    if [ -L "$file" ]; then
-      printf "%s %s -> %s\n" "$(ls -l "$file" | cut -d" " -f1)" "$file" "$(readlink -f "$file")"
-    else
-      printf "%s %s\n" "$(ls -l "$file" | cut -d" " -f1)" "$file"
-    fi
-  ' sh {} \; | sort | indent
-  
-  echo "Git cache directory contents:" | indent
-  find "$CACHE_DIR/git" \( -type f -o -type l \) -exec sh -c '
-    file="$1"
-    if [ -L "$file" ]; then
-      printf "%s %s -> %s\n" "$(ls -l "$file" | cut -d" " -f1)" "$file" "$(readlink -f "$file")"
-    else
-      printf "%s %s\n" "$(ls -l "$file" | cut -d" " -f1)" "$file"
-    fi
-  ' sh {} \; | sort | indent
+  cp -a --preserve=links "$CACHE_DIR/git"/* "$INSTALL_DIR"  # 
 else
   echo "Downloading Git version $git_version" | indent
   temp_dir="$(mktemp -d)"
@@ -165,13 +142,6 @@ else
     NO_ICONV=1
 
   make install NO_INSTALL_HARDLINKS=1
-
-  # Clean up Git installation
-#   rm -rf "$INSTALL_DIR"/share/git-gui \
-#          "$INSTALL_DIR"/share/gitk \
-#          "$INSTALL_DIR"/share/gitweb \
-#          "$INSTALL_DIR"/share/locale \
-#          "$INSTALL_DIR"/include
 
   echo "Cleaning up build artifacts" | indent
   make clean
@@ -342,19 +312,3 @@ export | grep -E -e ' PATH=' -e ' GIT_' >"$BUILDPACK_DIR/export"
 
 echo "Git and Unzip installation completed successfully" | indent
 
-# Print directory sizes
-echo "-----> Root directory sizes:"
-echo "Root folder contents (depth 0):" | indent
-du -sh /* 2>/dev/null | indent || echo "Cannot access root" | indent
-
-echo "-----> Complete build directory structure:"
-echo "Build directory sizes (depth 1):" | indent
-du -h --max-depth=1 "$BUILD_DIR" | indent
-
-echo "-----> Complete install directory structure:"
-echo "Install directory sizes (depth 1):" | indent
-du -h --max-depth=1 "$BUILD_DIR/.heroku" | indent
-
-echo "-----> Complete cache directory structure:"
-echo "Cache directory sizes (depth 1):" | indent
-du -h --max-depth=1 "$CACHE_DIR" | indent
