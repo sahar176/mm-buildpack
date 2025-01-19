@@ -254,19 +254,25 @@ else
     --disable-debug \
     --disable-ffplay \
     --disable-ffprobe \
-    --disable-everything \
-    --disable-network \
-    --disable-zlib \
-    --disable-iconv \
-    --disable-postproc \
-    --disable-swscale \
-    --disable-avfilter \
+    --enable-swscale \
+    --enable-avfilter \
+    --enable-filter=scale \
+    --enable-filter=fps \
+    --enable-filter=setpts \
+    --enable-filter=asetpts \
+    --enable-filter=pad \
     --enable-decoder=h264 \
+    --enable-decoder=mjpeg \
+    --enable-decoder=jpeg2000 \
+    --enable-demuxer=image2 \
+    --enable-demuxer=jpeg_pipe \
     --enable-encoder=libx264 \
     --enable-parser=h264 \
     --enable-protocol=file \
+    --enable-protocol=glob \
     --enable-demuxer=mov \
     --enable-muxer=mp4 \
+    --enable-muxer=image2 \
     --extra-cflags="-Os" \
     --extra-ldflags="-Wl,--strip-all"
 
