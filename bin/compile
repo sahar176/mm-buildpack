@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# bin/compile <BUILD_DIR> <CACHE_DIR> <ENV_DIR>
+
+set -eu -o pipefail
+
+# Variables
+default_git_version="2.42.0"
+default_unzip_version="6.0" # Standard unzip version
+BUILD_DIR="$1"
+CACHE_DIR="$2"
+ENV_DIR="$3"
+FORCE_GIT_REBUILD=false  # Set to 'true' to force Git rebuild
+
+function indent() {
+  c='s/^/       /'
+  case $(uname) in
+    Darwin) sed -l "$c";;
+    *)      sed -u "$c";;
+  esac
+}
+
+# Standardized curl retry function
+curl_retry_on_18() {
+  local ec=18;
+  local attempts=0;
+  while (( ec == 18 && attempts++ < 3 )); do
+    curl "$@"
+    ec=$?
+  done
+  return $ec
+}
+
+echo "-----> Root directory sizes:"
+echo "Root folder contents (depth 0):" | indent
+du -sh /* 2>/dev/null | indent || echo "Cannot access root" | indent
+
+# Install Git
+echo '-----> Installing Git'
+
+# Separate install directories for better organization
+INSTALL_DIR="$BUILD_DIR/.heroku/git"
+OPENSSL_INSTALL_DIR="$BUILD_DIR/.heroku/openssl"
+CURL_INSTALL_DIR="$BUILD_DIR/.heroku/curl"
+mkdir -p "$INSTALL_DIR" "$OPENSSL_INSTALL_DIR" "$CURL_INSTALL_DIR"
+
+# Get versions from environment or use defaults
+git_version="${GIT_VERSION:-$default_git_version}"
+default_openssl_version="3.1.4"  # Latest stable OpenSSL version
+default_curl_version="8.5.0"     # Latest stable curl version
+
+# Clean cache if rebuild is forced
+if [ "$FORCE_GIT_REBUILD" = "true" ] && [ -d "$CACHE_DIR/git" ]; then
+  echo "Clearing cached Git for forced rebuild" | indent
+  rm -rf "$CACHE_DIR/git"
+fi
+
+# Use cached version if available
+if [ -d "$CACHE_DIR/git" ]; then
+  echo "Using cached Git installation" | indent
+  cp -a --preserve=links "$CACHE_DIR/git"/* "$INSTALL_DIR"
+  
+  echo "Git install directory contents:" | indent
+  find "$INSTALL_DIR" \( -type f -o -type l \) -exec sh -c '
+    file="$1"
+    if [ -L "$file" ]; then
+      printf "%s %s -> %s\n" "$(ls -l "$file" | cut -d" " -f1)" "$file" "$(readlink -f "$file")"
+    else
+      printf "%s %s\n" "$(ls -l "$file" | cut -d" " -f1)" "$file"
+    fi
+  ' sh {} \; | sort | indent
+  
+  echo "Git cache directory contents:" | indent
+  find "$CACHE_DIR/git" \( -type f -o -type l \) -exec sh -c '
+    file="$1"
+    if [ -L "$file" ]; then
+      printf "%s %s -> %s\n" "$(ls -l "$file" | cut -d" " -f1)" "$file" "$(readlink -f "$file")"
+    else
+      printf "%s %s\n" "$(ls -l "$file" | cut -d" " -f1)" "$file"
+    fi
+  ' sh {} \; | sort | indent
+else
+  echo "Downloading Git version $git_version" | indent
+  temp_dir="$(mktemp -d)"
+  
+  # Build OpenSSL first
+  echo "Building OpenSSL" | indent
+  curl_retry_on_18 -L --fail --retry 3 --retry-connrefused --connect-timeout 3 \
+    "https://www.openssl.org/source/openssl-${default_openssl_version}.tar.gz" | tar xz -C "$temp_dir"
+  
+  cd "$temp_dir/openssl-${default_openssl_version}"
+  # Install OpenSSL to its own directory
+  ./Configure --prefix="$OPENSSL_INSTALL_DIR" no-shared no-tests no-weak-ssl-ciphers \
+    no-dtls no-tls1 no-tls1_1 no-ssl3 no-idea no-seed \
+    no-camellia no-bf no-cast no-md2 no-md4 no-mdc2 no-rc2 no-rc4 no-rc5
+
+  make -j$(nproc)
+  make install_sw
+
+  # Clean up OpenSSL installation
+  rm -rf "$OPENSSL_INSTALL_DIR"/lib/*.a \
+         "$OPENSSL_INSTALL_DIR"/lib/pkgconfig \
+         "$OPENSSL_INSTALL_DIR"/include \
+         "$OPENSSL_INSTALL_DIR"/share
+
+  # Install curl with SSL support
+  echo "Building curl with SSL support" | indent
+  curl_retry_on_18 -L --fail --retry 3 --retry-connrefused --connect-timeout 3 \
+    "https://curl.se/download/curl-${default_curl_version}.tar.gz" | tar xz -C "$temp_dir"
+
+  cd "$temp_dir/curl-${default_curl_version}"
+  ./configure --prefix="$CURL_INSTALL_DIR" \
+    --with-openssl="$OPENSSL_INSTALL_DIR" \
+    --with-ssl \
+    --enable-static \
+    --enable-shared \
+    --disable-ldap \
+    --disable-ldaps \
+    --disable-manual \
+    --disable-proxy \
+    --disable-unix-sockets \
+    --disable-dict \
+    --disable-telnet \
+    --disable-tftp \
+    --disable-pop3 \
+    --disable-imap \
+    --disable-smb \
+    --disable-smtp \
+    --disable-gopher \
+    --disable-mqtt \
+    --disable-ntlm \
+    CPPFLAGS="-I$OPENSSL_INSTALL_DIR/include" \
+    LDFLAGS="-L$OPENSSL_INSTALL_DIR/lib -Wl,-rpath,$OPENSSL_INSTALL_DIR/lib"
+
+  make -j$(nproc)
+  make install
+
+  # Now build Git with our custom curl
+  echo "Building Git with HTTPS support" | indent
+  curl_retry_on_18 -L --fail --retry 3 --retry-connrefused --connect-timeout 3 \
+    "https://github.com/git/git/archive/refs/tags/v$git_version.tar.gz" | tar xz -C "$temp_dir"
+
+  cd "$temp_dir/git-$git_version"
+  
+  make configure
+  ./configure prefix="$INSTALL_DIR" \
+    CFLAGS="-I$OPENSSL_INSTALL_DIR/include -I$CURL_INSTALL_DIR/include" \
+    LDFLAGS="-L$OPENSSL_INSTALL_DIR/lib -L$CURL_INSTALL_DIR/lib -Wl,-rpath,$OPENSSL_INSTALL_DIR/lib:$CURL_INSTALL_DIR/lib" \
+    --with-openssl="$OPENSSL_INSTALL_DIR" \
+    --with-libpcre \
+    CURLDIR="$CURL_INSTALL_DIR" \
+    CURL_CONFIG="$CURL_INSTALL_DIR/bin/curl-config" \
+    NO_INSTALL_HARDLINKS=1
+
+  make -j$(nproc) \
+    CFLAGS="-I$OPENSSL_INSTALL_DIR/include -I$CURL_INSTALL_DIR/include" \
+    LDFLAGS="-L$OPENSSL_INSTALL_DIR/lib -L$CURL_INSTALL_DIR/lib -Wl,-rpath,$OPENSSL_INSTALL_DIR/lib:$CURL_INSTALL_DIR/lib" \
+    NO_INSTALL_HARDLINKS=1 \
+    CURLDIR="$CURL_INSTALL_DIR" \
+    CURL_CONFIG="$CURL_INSTALL_DIR/bin/curl-config" \
+    NO_GETTEXT=1 \
+    NO_PERL=1 \
+    NO_PYTHON=1 \
+    NO_TCLTK=1 \
+    NO_MSGFMT=1 \
+    NO_ICONV=1
+
+  make install NO_INSTALL_HARDLINKS=1
+
+  # Clean up Git installation
+#   rm -rf "$INSTALL_DIR"/share/git-gui \
+#          "$INSTALL_DIR"/share/gitk \
+#          "$INSTALL_DIR"/share/gitweb \
+#          "$INSTALL_DIR"/share/locale \
+#          "$INSTALL_DIR"/include
+
+  echo "Cleaning up build artifacts" | indent
+  make clean
+  
+  echo "Cleaning up build directory" | indent
+  rm -rf "$temp_dir"
+
+  echo "Caching Git installation" | indent
+  mkdir -p "$CACHE_DIR/git"
+  cp -a --preserve=links "$INSTALL_DIR"/. "$CACHE_DIR/git"
+fi
+
+# Install Unzip
+echo '-----> Installing Unzip'
+
+UNZIP_INSTALL_DIR="$BUILD_DIR/.heroku/unzip"
+mkdir -p "$UNZIP_INSTALL_DIR"
+
+# Get Unzip version from environment or use default
+unzip_version="${UNZIP_VERSION:-$default_unzip_version}"
+
+# Use cached version if available
+if [ -d "$CACHE_DIR/unzip" ]; then
+  echo "Using cached Unzip installation" | indent
+  cp -a --preserve=links "$CACHE_DIR/unzip"/* "$UNZIP_INSTALL_DIR"
+else
+  echo "Downloading Unzip version $unzip_version" | indent
+  temp_dir="$(mktemp -d)"
+  curl_retry_on_18 -L --fail --retry 3 --retry-connrefused --connect-timeout 3 \
+    "https://downloads.sourceforge.net/infozip/unzip${unzip_version/./}.tar.gz" | tar xz -C "$temp_dir"
+
+  # Find the actual unzip directory
+  source_dir=$(find "$temp_dir" -type d -name "unzip*" -maxdepth 1)
+  if [ -z "$source_dir" ]; then
+    echo "Failed to find unzip source directory" | indent
+    exit 1
+  fi
+  
+  echo "Building Unzip from source in $source_dir" | indent
+  cd "$source_dir"
+  
+  make -f unix/Makefile generic prefix="$UNZIP_INSTALL_DIR"
+  make -f unix/Makefile install prefix="$UNZIP_INSTALL_DIR"
+  
+  echo "Cleaning up build artifacts" | indent
+  rm -rf "$temp_dir"
+
+  echo "Caching Unzip installation" | indent
+  mkdir -p "$CACHE_DIR/unzip"
+  cp -a --preserve=links "$UNZIP_INSTALL_DIR"/. "$CACHE_DIR/unzip"
+fi
+
+# Install FFmpeg
+echo '-----> Installing FFmpeg'
+
+FFMPEG_INSTALL_DIR="$BUILD_DIR/.heroku/ffmpeg"
+mkdir -p "$FFMPEG_INSTALL_DIR"
+
+# Get FFmpeg version from environment or use default
+default_ffmpeg_version="7.0"
+ffmpeg_version="${FFMPEG_VERSION:-$default_ffmpeg_version}"
+default_nasm_version="2.16.01"  # Latest stable version of NASM
+
+# Use cached version if available
+if [ -d "$CACHE_DIR/ffmpeg" ]; then
+  echo "Using cached FFmpeg installation" | indent
+  cp -a --preserve=links "$CACHE_DIR/ffmpeg"/* "$FFMPEG_INSTALL_DIR"
+else
+  echo "Downloading FFmpeg version $ffmpeg_version" | indent
+  temp_dir="$(mktemp -d)"
+  
+  # Install NASM first
+  echo "Installing NASM" | indent
+  curl_retry_on_18 -L --fail --retry 3 --retry-connrefused --connect-timeout 3 \
+    "https://www.nasm.us/pub/nasm/releasebuilds/${default_nasm_version}/nasm-${default_nasm_version}.tar.gz" | tar xz -C "$temp_dir"
+  
+  cd "$temp_dir/nasm-${default_nasm_version}"
+  ./configure --prefix="$temp_dir/nasm-install"
+  make -j$(nproc)
+  make install
+  export PATH="$temp_dir/nasm-install/bin:$PATH"
+  
+  # Download and build x264
+  echo "Building x264" | indent
+  curl_retry_on_18 -L --fail --retry 3 --retry-connrefused --connect-timeout 3 \
+    "https://code.videolan.org/videolan/x264/-/archive/master/x264-master.tar.gz" | tar xz -C "$temp_dir"
+  
+  cd "$temp_dir"/x264-master
+  ./configure --prefix="$FFMPEG_INSTALL_DIR" --enable-shared --enable-pic
+  make -j$(nproc)
+  make install
+  
+  # Download and build FFmpeg with minimal configuration
+  echo "Building FFmpeg" | indent
+  curl_retry_on_18 -L --fail --retry 3 --retry-connrefused --connect-timeout 3 \
+    "https://ffmpeg.org/releases/ffmpeg-$ffmpeg_version.tar.gz" | tar xz -C "$temp_dir"
+  
+  cd "$temp_dir/ffmpeg-$ffmpeg_version"
+  PKG_CONFIG_PATH="$FFMPEG_INSTALL_DIR/lib/pkgconfig" ./configure \
+    --prefix="$FFMPEG_INSTALL_DIR" \
+    --enable-gpl \
+    --enable-libx264 \
+    --enable-shared \
+    --disable-static \
+    --disable-doc \
+    --disable-htmlpages \
+    --disable-manpages \
+    --disable-podpages \
+    --disable-txtpages \
+    --disable-debug \
+    --disable-ffplay \
+    --disable-ffprobe \
+    --disable-everything \
+    --disable-network \
+    --disable-zlib \
+    --disable-iconv \
+    --disable-postproc \
+    --disable-swscale \
+    --disable-avfilter \
+    --enable-decoder=h264 \
+    --enable-encoder=libx264 \
+    --enable-parser=h264 \
+    --enable-protocol=file \
+    --enable-demuxer=mov \
+    --enable-muxer=mp4 \
+    --extra-cflags="-Os" \
+    --extra-ldflags="-Wl,--strip-all"
+
+  make -j$(nproc)
+  make install
+
+  # Clean up FFmpeg installation
+  rm -rf "$FFMPEG_INSTALL_DIR"/share \
+         "$FFMPEG_INSTALL_DIR"/include \
+         "$FFMPEG_INSTALL_DIR"/lib/pkgconfig \
+         "$FFMPEG_INSTALL_DIR"/lib/*.a \
+         "$FFMPEG_INSTALL_DIR"/lib/*.la
+
+  echo "Cleaning up build artifacts and NASM" | indent
+  rm -rf "$temp_dir"
+
+  echo "Caching FFmpeg installation" | indent
+  mkdir -p "$CACHE_DIR/ffmpeg"
+  cp -a --preserve=links "$FFMPEG_INSTALL_DIR"/. "$CACHE_DIR/ffmpeg"
+fi
+
+# Get the buildpack directory
+BUILDPACK_DIR="$(dirname "$(dirname "$0")")"
+
+# Create paths string for FFmpeg, Git, and Unzip
+paths="\$HOME/.heroku/git/bin
+\$HOME/.heroku/unzip/bin
+\$HOME/.heroku/ffmpeg/bin"
+
+# Write to profile.d for runtime
+cat <<EOF >"$BUILD_DIR/.profile.d/000_git_unzip_ffmpeg.sh"
+export PATH="$(echo "$paths" | paste -s -d ':' -)\${PATH:+:}\$PATH"
+export LD_LIBRARY_PATH="\$HOME/.heroku/ffmpeg/lib:\${LD_LIBRARY_PATH:-}"
+export GIT_EXEC_PATH="\$HOME/.heroku/git/libexec/git-core"
+export GIT_TEMPLATE_DIR="\$HOME/.heroku/git/share/git-core/templates"
+EOF
+
+# Export for subsequent buildpacks
+export PATH="$BUILD_DIR/.heroku/git/bin:$BUILD_DIR/.heroku/unzip/bin:$FFMPEG_INSTALL_DIR/bin${PATH:+:}${PATH:-}"
+export GIT_EXEC_PATH="/app/.heroku/git/libexec/git-core"
+export GIT_TEMPLATE_DIR="/app/.heroku/git/share/git-core/templates"
+export | grep -E -e ' PATH=' -e ' GIT_' >"$BUILDPACK_DIR/export"
+
+echo "Git and Unzip installation completed successfully" | indent
+
+# Print directory sizes
+echo "-----> Root directory sizes:"
+echo "Root folder contents (depth 0):" | indent
+du -sh /* 2>/dev/null | indent || echo "Cannot access root" | indent
+
+echo "-----> Complete build directory structure:"
+echo "Build directory sizes (depth 1):" | indent
+du -h --max-depth=1 "$BUILD_DIR" | indent
+
+echo "-----> Complete install directory structure:"
+echo "Install directory sizes (depth 1):" | indent
+du -h --max-depth=1 "$BUILD_DIR/.heroku" | indent
+
+echo "-----> Complete cache directory structure:"
+echo "Cache directory sizes (depth 1):" | indent
+du -h --max-depth=1 "$CACHE_DIR" | indent
