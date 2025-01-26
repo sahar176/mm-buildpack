@@ -302,6 +302,9 @@ paths="\$HOME/.heroku/git/bin
 \$HOME/.heroku/unzip/bin
 \$HOME/.heroku/ffmpeg/bin"
 
+# Create .profile.d directory if it doesn't exist
+mkdir -p "$BUILD_DIR/.profile.d"
+
 # Write to profile.d for runtime
 cat <<EOF >"$BUILD_DIR/.profile.d/000_git_unzip_ffmpeg.sh"
 export PATH="$(echo "$paths" | paste -s -d ':' -)\${PATH:+:}\$PATH"
